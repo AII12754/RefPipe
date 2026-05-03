@@ -328,6 +328,9 @@ VLLM_PP_REFCACHE_ENABLE=0
 VLLM_PP_REFCACHE_CODEC=int8
 VLLM_PP_REFCACHE_MIN_HIDDEN_BYTES=1048576
 VLLM_PP_REFCACHE_INT8_GROUP_SIZE=128
+VLLM_PP_REFCACHE_MAX_TOKENS=100000
+VLLM_PP_REFCACHE_MIN_MATCH_RATE=0.0
+VLLM_PP_REFCACHE_MAX_PACKET_RATIO=1.0
 ```
 
 ### Milestone 2: Phase 1 Match Plan
@@ -351,11 +354,15 @@ VLLM_PP_REFCACHE_INT8_GROUP_SIZE=128
 - Encode unmatched regions as quantized raw hidden.
 - Commit reconstructed hidden on both sender and receiver.
 - Add deterministic cache capacity eviction.
+- Fail closed if the receiver is asked to decode a delta whose reference is
+  missing.
+- Gate delta use by minimum matched-token rate.
+- Fall back to the original PP path if the estimated compressed packet ratio
+  exceeds `VLLM_PP_REFCACHE_MAX_PACKET_RATIO`.
 - First implementation scope:
   - delta matching is enabled only when the PP payload remains a local
-    `[tokens, hidden]` tensor;
-  - TP all-gather slice packets stay on raw INT8 transport and skip cache
-    commit until Milestone 4 adds shard-aware keys;
+    `[tokens, hidden]` tensor. Milestone 4 extends this to TP all-gather
+    slices that align with full token rows;
   - decode/mixed-batch non-prefill tokens remain raw INT8 and are not committed
     to RefCache state.
 - Raw fp16 fallback regions and fused numerical-error guards remain future
@@ -366,13 +373,29 @@ VLLM_PP_REFCACHE_INT8_GROUP_SIZE=128
 - Implement replicated-hidden local slice compression.
 - Decode local slices before TP all-gather.
 - Add sequence-parallel token-shard packet metadata.
+- First implementation scope:
+  - when vLLM's PP all-gather optimization slices the flattened hidden tensor
+    on token-row boundaries, each TP rank clips the Phase 1 plan to its local
+    token rows and applies RefCache delta locally before/after PP transfer;
+  - when a flat slice cuts through a token row, the packet remains raw INT8 and
+    skips RefCache commit;
+  - token-row local packets commit shard-local hidden vectors under the same
+    request/token keys in each TP rank process, so sender/receiver state stays
+    aligned without changing the existing flat slice communication contract.
 - Add tests for TP sizes greater than one.
 - Add tests for mixed prefill/decode batches.
 
 ### Milestone 5: Fused Kernels and Tuning
 
-- Add fused subtract-reference-and-quantize kernel.
-- Add fused dequantize-and-add-reference kernel.
+- Add fused subtract-reference-and-quantize kernel. The Python implementation
+  already isolates this behind the encode path that computes
+  `hidden - ref -> q_payload, scales, reconstructed`.
+- Add fused dequantize-and-add-reference kernel. The Python implementation
+  already isolates this behind the decode path that computes
+  `q_payload, scales, ref -> reconstructed`.
+- First Triton implementation lives in
+  `vllm/distributed/pp_refcache_kernels.py` and is used for CUDA 2D
+  `[tokens, hidden]` tensors with matched reference rows.
 - Tune thresholds for hidden bytes, match rate, and estimated packet ratio.
 - Benchmark against raw PP transfer on prefill-heavy workloads.
 - Add quality regression tests for selected models and prompts.

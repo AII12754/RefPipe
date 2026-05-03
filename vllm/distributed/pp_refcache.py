@@ -25,6 +25,10 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.distributed.pp_refcache_kernels import (
+    triton_decode_int8_with_refs,
+    triton_encode_int8_with_refs,
+)
 
 _VERSION = 1
 _PHASE1_VERSION = 1
@@ -42,11 +46,14 @@ _TENSOR_NAME_KEY = "__pp_refcache_tensor_name__"
 _ORIG_SHAPE_KEY = "__pp_refcache_orig_shape__"
 _ORIG_DTYPE_KEY = "__pp_refcache_orig_dtype__"
 _USED_ALL_GATHER_KEY = "__pp_refcache_used_all_gather__"
+_LOCAL_TOKEN_START_KEY = "__pp_refcache_local_token_start__"
+_LOCAL_TOKEN_COUNT_KEY = "__pp_refcache_local_token_count__"
 _GROUP_SIZE_KEY = "__pp_refcache_group_size__"
 _RAW_TENSORS_KEY = "__pp_refcache_raw_tensors__"
 _Q_PAYLOAD_KEY = "__pp_refcache_q_payload__"
 _SCALES_KEY = "__pp_refcache_scales__"
 _DELTA_MATCH_SPANS_KEY = "__pp_refcache_delta_match_spans__"
+_PACKET_STATS_KEY = "__pp_refcache_packet_stats__"
 _DEFAULT_MAX_CACHE_TOKENS = 100000
 
 
@@ -56,6 +63,9 @@ class PPRefCacheConfig:
     codec: str
     min_hidden_bytes: int
     int8_group_size: int
+    max_cache_tokens: int = _DEFAULT_MAX_CACHE_TOKENS
+    min_match_rate: float = 0.0
+    max_packet_ratio: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,10 @@ class _BoundaryRefCache:
         self._hiddens.clear()
         self._bigram_index.clear()
 
+    def set_max_tokens(self, max_tokens: int) -> None:
+        self.max_tokens = max(0, max_tokens)
+        self._evict_if_needed()
+
     def match_segment(
         self,
         batch_start: int,
@@ -102,11 +116,16 @@ class _BoundaryRefCache:
             best_ref: tuple[int, int] | None = None
             best_len = 0
             for ref_uid, ref_token_idx in candidates:
-                if self._token_fps.get((ref_uid, ref_token_idx)) != token_fps[i]:
+                ref_key = (ref_uid, ref_token_idx)
+                if ref_key not in self._hiddens:
+                    continue
+                if self._token_fps.get(ref_key) != token_fps[i]:
                     continue
                 match_len = 1
                 while i + match_len < len(token_fps):
                     key = (ref_uid, ref_token_idx + match_len)
+                    if key not in self._hiddens:
+                        break
                     if self._token_fps.get(key) != token_fps[i + match_len]:
                         break
                     match_len += 1
@@ -161,6 +180,19 @@ class _BoundaryRefCache:
             torch.stack(refs).to(device=device, dtype=dtype, non_blocking=True),
         )
 
+    def has_refs(self, match_spans: torch.Tensor) -> bool:
+        for span in match_spans.detach().cpu().tolist():
+            _, length, ref_uid, ref_start = (
+                int(span[0]),
+                int(span[1]),
+                int(span[2]),
+                int(span[3]),
+            )
+            for offset in range(length):
+                if (ref_uid, ref_start + offset) not in self._hiddens:
+                    return False
+        return True
+
     def commit(
         self,
         plan: PPRefCachePhase1Plan | None,
@@ -170,11 +202,9 @@ class _BoundaryRefCache:
             return
         if hidden_states.ndim < 2:
             return
-        if hidden_states.shape[0] < plan.num_global_tokens:
-            return
 
         token_fps: list[int] | None = None
-        if plan.token_fps is not None:
+        if plan.token_fps is not None and plan.token_fps.numel() > 0:
             token_fps = [int(x) for x in plan.token_fps.detach().cpu().tolist()]
         fp_offset = 0
         for segment in plan.token_segments.detach().cpu().tolist():
@@ -189,7 +219,11 @@ class _BoundaryRefCache:
                 if token_fps is not None
                 else [0] * length
             )
+            if len(segment_fps) != length:
+                segment_fps = [0] * length
             fp_offset += length
+            if batch_start + length > hidden_states.shape[0]:
+                continue
             rows = hidden_states[batch_start : batch_start + length].detach().cpu()
             for offset, row in enumerate(rows):
                 token_idx = token_start + offset
@@ -215,12 +249,18 @@ _RECV_CACHE = _BoundaryRefCache()
 
 
 def get_pp_refcache_config() -> PPRefCacheConfig:
-    return PPRefCacheConfig(
+    config = PPRefCacheConfig(
         enabled=envs.VLLM_PP_REFCACHE_ENABLE,
         codec=envs.VLLM_PP_REFCACHE_CODEC.lower(),
         min_hidden_bytes=envs.VLLM_PP_REFCACHE_MIN_HIDDEN_BYTES,
         int8_group_size=envs.VLLM_PP_REFCACHE_INT8_GROUP_SIZE,
+        max_cache_tokens=envs.VLLM_PP_REFCACHE_MAX_TOKENS,
+        min_match_rate=envs.VLLM_PP_REFCACHE_MIN_MATCH_RATE,
+        max_packet_ratio=envs.VLLM_PP_REFCACHE_MAX_PACKET_RATIO,
     )
+    _SEND_CACHE.set_max_tokens(config.max_cache_tokens)
+    _RECV_CACHE.set_max_tokens(config.max_cache_tokens)
+    return config
 
 
 def clear_pp_refcache_state() -> None:
@@ -345,7 +385,9 @@ def build_phase1_plan(
             )
             segment_fps = []
             if req_token_ids is not None:
-                segment_token_ids = req_token_ids[token_start : token_start + prefill_len]
+                segment_token_ids = req_token_ids[
+                    token_start : token_start + prefill_len
+                ]
                 segment_fps = _fingerprint_tokens(segment_token_ids)
             if len(segment_fps) != prefill_len:
                 segment_fps = [0] * prefill_len
@@ -443,6 +485,122 @@ def _phase1_from_tensor_dict(
         match_spans=match_spans,
         self_ref_spans=self_ref_spans,
     )
+
+
+def _clip_phase1_plan_to_token_rows(
+    plan: PPRefCachePhase1Plan | None,
+    row_start: int,
+    row_count: int,
+) -> PPRefCachePhase1Plan | None:
+    if plan is None or plan.token_segments.numel() == 0 or row_count <= 0:
+        return None
+
+    token_fps = (
+        [int(x) for x in plan.token_fps.detach().cpu().tolist()]
+        if plan.token_fps is not None
+        else []
+    )
+    clipped_segments: list[list[int]] = []
+    clipped_fps: list[int] = []
+    fp_offset = 0
+    for segment in plan.token_segments.detach().cpu().tolist():
+        batch_start, length, token_start, req_uid, flags = (
+            int(segment[0]),
+            int(segment[1]),
+            int(segment[2]),
+            int(segment[3]),
+            int(segment[4]),
+        )
+        segment_end = batch_start + length
+        clip_start = max(batch_start, row_start)
+        clip_end = min(segment_end, row_start + row_count)
+        if clip_start < clip_end:
+            rel_start = clip_start - batch_start
+            clip_len = clip_end - clip_start
+            clipped_segments.append(
+                [
+                    clip_start - row_start,
+                    clip_len,
+                    token_start + rel_start,
+                    req_uid,
+                    flags,
+                ]
+            )
+            if token_fps:
+                clipped_fps.extend(
+                    token_fps[fp_offset + rel_start : fp_offset + rel_start + clip_len]
+                )
+        fp_offset += length
+
+    clipped_matches: list[list[int]] = []
+    for span in plan.match_spans.detach().cpu().tolist():
+        batch_start, length, ref_uid, ref_start, segment_idx, flags = (
+            int(span[0]),
+            int(span[1]),
+            int(span[2]),
+            int(span[3]),
+            int(span[4]),
+            int(span[5]),
+        )
+        span_end = batch_start + length
+        clip_start = max(batch_start, row_start)
+        clip_end = min(span_end, row_start + row_count)
+        if clip_start < clip_end:
+            rel_start = clip_start - batch_start
+            clipped_matches.append(
+                [
+                    clip_start - row_start,
+                    clip_end - clip_start,
+                    ref_uid,
+                    ref_start + rel_start,
+                    segment_idx,
+                    flags,
+                ]
+            )
+
+    if not clipped_segments:
+        return None
+    token_segments = torch.tensor(clipped_segments, dtype=torch.int64)
+    match_spans = (
+        torch.tensor(clipped_matches, dtype=torch.int64)
+        if clipped_matches
+        else _empty_phase1_tensor(6)
+    )
+    token_fps_tensor = (
+        torch.tensor(clipped_fps, dtype=torch.int64)
+        if clipped_fps
+        else torch.empty(0, dtype=torch.int64)
+    )
+    return PPRefCachePhase1Plan(
+        plan_id=plan.plan_id,
+        num_global_tokens=row_count,
+        tp_rank=plan.tp_rank,
+        tp_size=plan.tp_size,
+        token_segments=token_segments,
+        match_spans=match_spans,
+        self_ref_spans=_empty_phase1_tensor(4),
+        token_fps=token_fps_tensor,
+    )
+
+
+def _all_gather_token_row_slice(
+    hidden_states: torch.Tensor,
+    all_gather_group: GroupCoordinator | None,
+) -> tuple[int, int] | None:
+    if all_gather_group is None or hidden_states.ndim < 2:
+        return None
+    hidden_dim = hidden_states.shape[-1]
+    if hidden_dim <= 0:
+        return None
+    tp_size = all_gather_group.world_size
+    if hidden_states.numel() % tp_size != 0:
+        return None
+    chunk_elems = hidden_states.numel() // tp_size
+    start_elem = all_gather_group.rank_in_group * chunk_elems
+    end_elem = start_elem + chunk_elems
+    if start_elem % hidden_dim != 0 or end_elem % hidden_dim != 0:
+        return None
+    return start_elem // hidden_dim, chunk_elems // hidden_dim
 
 
 def _is_supported_hidden_tensor(
@@ -566,6 +724,71 @@ def _subtract_delta_refs(
     return encoded
 
 
+def _encode_int8_with_refs(
+    hidden_states: torch.Tensor,
+    match_spans: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if match_spans.numel() == 0:
+        return None
+    positions, refs = _SEND_CACHE.get_refs(
+        match_spans,
+        hidden_states.device,
+        hidden_states.dtype,
+    )
+    if positions.numel() == 0:
+        return None
+    return triton_encode_int8_with_refs(
+        hidden_states.contiguous(),
+        positions,
+        refs.contiguous(),
+        group_size,
+    )
+
+
+def _decode_int8_with_refs(
+    q_payload: torch.Tensor,
+    scales: torch.Tensor,
+    match_spans: torch.Tensor,
+    group_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if match_spans.numel() == 0:
+        return None
+    positions, refs = _RECV_CACHE.get_refs(match_spans, q_payload.device, dtype)
+    if positions.numel() == 0:
+        return None
+    return triton_decode_int8_with_refs(
+        q_payload.contiguous(),
+        scales.contiguous(),
+        positions,
+        refs.contiguous(),
+        group_size,
+        dtype,
+    )
+
+
+def _count_span_tokens(match_spans: torch.Tensor) -> int:
+    if match_spans.numel() == 0:
+        return 0
+    return int(match_spans[:, 1].sum().item())
+
+
+def _packet_payload_ratio(
+    q_payload: torch.Tensor,
+    scales: torch.Tensor,
+    match_spans: torch.Tensor,
+    raw_tensor: torch.Tensor,
+) -> float:
+    compressed_bytes = q_payload.numel() * q_payload.element_size()
+    compressed_bytes += scales.numel() * scales.element_size()
+    compressed_bytes += match_spans.numel() * match_spans.element_size()
+    raw_bytes = raw_tensor.numel() * raw_tensor.element_size()
+    if raw_bytes == 0:
+        return 1.0
+    return compressed_bytes / raw_bytes
+
+
 def _make_send_tensor(
     pp_group: GroupCoordinator,
     tensor: torch.Tensor,
@@ -625,28 +848,63 @@ def _encode_packet(
 
     match_spans = _empty_phase1_tensor(6)
     encode_tensor = send_tensor
-    can_use_delta = (
-        phase1_plan is not None
-        and phase1_plan.match_spans.numel() > 0
-        and not used_all_gather
-        and send_tensor.ndim >= 2
-        and send_tensor.shape[0] >= phase1_plan.num_global_tokens
-    )
-    if can_use_delta:
-        match_spans = phase1_plan.match_spans
-        encode_tensor = _subtract_delta_refs(send_tensor, match_spans)
+    commit_plan = phase1_plan
+    local_token_start: int | None = None
+    local_token_count: int | None = None
+    if used_all_gather:
+        token_row_slice = _all_gather_token_row_slice(hidden_states, all_gather_group)
+        if token_row_slice is not None:
+            local_token_start, local_token_count = token_row_slice
+            commit_plan = _clip_phase1_plan_to_token_rows(
+                phase1_plan,
+                local_token_start,
+                local_token_count,
+            )
+            if commit_plan is not None:
+                encode_tensor = send_tensor.reshape(local_token_count, -1)
+        else:
+            commit_plan = None
 
-    q_payload, scales = _quantize_int8(encode_tensor, config.int8_group_size)
-    reconstructed = _dequantize_int8(
-        q_payload,
-        scales,
-        config.int8_group_size,
-        send_tensor.dtype,
+    can_use_delta = (
+        commit_plan is not None
+        and commit_plan.match_spans.numel() > 0
+        and _SEND_CACHE.has_refs(commit_plan.match_spans)
+        and encode_tensor.ndim >= 2
+        and encode_tensor.shape[0] >= commit_plan.num_global_tokens
     )
+    if can_use_delta and config.min_match_rate > 0.0:
+        matched_tokens = _count_span_tokens(commit_plan.match_spans)
+        can_use_delta = (
+            matched_tokens / max(1, commit_plan.num_global_tokens)
+        ) >= config.min_match_rate
     if can_use_delta:
-        reconstructed = _apply_delta_refs(reconstructed, match_spans, _SEND_CACHE)
-    if not used_all_gather:
-        _SEND_CACHE.commit(phase1_plan, reconstructed)
+        match_spans = commit_plan.match_spans
+    fused_encoded = (
+        _encode_int8_with_refs(encode_tensor, match_spans, config.int8_group_size)
+        if can_use_delta
+        else None
+    )
+    if fused_encoded is not None:
+        q_payload, scales, reconstructed = fused_encoded
+    else:
+        if can_use_delta:
+            encode_tensor = _subtract_delta_refs(encode_tensor, match_spans)
+        q_payload, scales = _quantize_int8(encode_tensor, config.int8_group_size)
+        reconstructed = _dequantize_int8(
+            q_payload,
+            scales,
+            config.int8_group_size,
+            send_tensor.dtype,
+        )
+        if can_use_delta:
+            reconstructed = _apply_delta_refs(reconstructed, match_spans, _SEND_CACHE)
+
+    packet_ratio = _packet_payload_ratio(q_payload, scales, match_spans, send_tensor)
+    if packet_ratio > config.max_packet_ratio:
+        return None
+
+    if commit_plan is not None:
+        _SEND_CACHE.commit(commit_plan, reconstructed)
 
     raw_tensors = {
         key: value
@@ -661,11 +919,17 @@ def _encode_packet(
         _ORIG_SHAPE_KEY: tuple(hidden_states.shape),
         _ORIG_DTYPE_KEY: hidden_states.dtype,
         _USED_ALL_GATHER_KEY: used_all_gather,
+        _LOCAL_TOKEN_START_KEY: local_token_start,
+        _LOCAL_TOKEN_COUNT_KEY: local_token_count,
         _GROUP_SIZE_KEY: config.int8_group_size,
         _RAW_TENSORS_KEY: raw_tensors,
         _Q_PAYLOAD_KEY: q_payload,
         _SCALES_KEY: scales,
         _DELTA_MATCH_SPANS_KEY: match_spans,
+        _PACKET_STATS_KEY: {
+            "matched_tokens": _count_span_tokens(match_spans),
+            "packet_ratio": packet_ratio,
+        },
     }
 
 
@@ -699,22 +963,47 @@ def _decode_packet(
     assert isinstance(q_payload, torch.Tensor)
     assert isinstance(scales, torch.Tensor)
 
-    hidden_states = _dequantize_int8(
+    match_spans = tensor_dict.get(_DELTA_MATCH_SPANS_KEY, _empty_phase1_tensor(6))
+    assert isinstance(match_spans, torch.Tensor)
+    if match_spans.numel() > 0 and not _RECV_CACHE.has_refs(match_spans):
+        raise RuntimeError("PP RefCache receiver is missing a referenced activation")
+    hidden_states = _decode_int8_with_refs(
         q_payload,
         scales,
+        match_spans,
         int(tensor_dict[_GROUP_SIZE_KEY]),
         tensor_dict[_ORIG_DTYPE_KEY],
     )
-    match_spans = tensor_dict.get(_DELTA_MATCH_SPANS_KEY, _empty_phase1_tensor(6))
-    assert isinstance(match_spans, torch.Tensor)
-    hidden_states = _apply_delta_refs(hidden_states, match_spans, _RECV_CACHE)
+    if hidden_states is None:
+        hidden_states = _dequantize_int8(
+            q_payload,
+            scales,
+            int(tensor_dict[_GROUP_SIZE_KEY]),
+            tensor_dict[_ORIG_DTYPE_KEY],
+        )
+        hidden_states = _apply_delta_refs(hidden_states, match_spans, _RECV_CACHE)
+    commit_plan = expected_phase1_plan
+    if tensor_dict[_USED_ALL_GATHER_KEY]:
+        local_token_start = tensor_dict.get(_LOCAL_TOKEN_START_KEY)
+        local_token_count = tensor_dict.get(_LOCAL_TOKEN_COUNT_KEY)
+        if local_token_start is not None and local_token_count is not None:
+            commit_plan = _clip_phase1_plan_to_token_rows(
+                expected_phase1_plan,
+                int(local_token_start),
+                int(local_token_count),
+            )
+            if commit_plan is not None:
+                _RECV_CACHE.commit(commit_plan, hidden_states)
+        else:
+            commit_plan = None
+
     if tensor_dict[_USED_ALL_GATHER_KEY]:
         if all_gather_group is None:
             raise ValueError("PP RefCache packet requires an all-gather group")
         hidden_states = all_gather_group.all_gather(hidden_states, dim=0)
     hidden_states = hidden_states.reshape(tensor_dict[_ORIG_SHAPE_KEY])
     if not tensor_dict[_USED_ALL_GATHER_KEY]:
-        _RECV_CACHE.commit(expected_phase1_plan, hidden_states)
+        _RECV_CACHE.commit(commit_plan, hidden_states)
 
     decoded = dict(tensor_dict[_RAW_TENSORS_KEY])
     decoded[tensor_dict[_TENSOR_NAME_KEY]] = hidden_states

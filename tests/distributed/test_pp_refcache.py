@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.distributed import pp_refcache
+from vllm.distributed.pp_refcache_kernels import triton_encode_int8_with_refs
 
 
 @pytest.fixture(autouse=True)
@@ -159,6 +160,7 @@ def test_pp_refcache_delta_roundtrip_uses_committed_refs() -> None:
         codec="int8",
         min_hidden_bytes=0,
         int8_group_size=4,
+        max_packet_ratio=10.0,
     )
 
     first_plan = pp_refcache.build_phase1_plan(
@@ -211,6 +213,224 @@ def test_pp_refcache_delta_roundtrip_uses_committed_refs() -> None:
     )
     assert second_decoded["hidden_states"].shape == second_hidden.shape
     assert torch.allclose(second_decoded["hidden_states"], second_hidden, atol=0.05)
+
+
+def test_pp_refcache_all_gather_token_row_slice_uses_local_refs() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+        max_packet_ratio=10.0,
+    )
+    all_gather_group = FakeAllGatherGroup()
+
+    first_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("first", [10, 11, 12, 13]),
+        all_gather_group,
+    )
+    first_hidden = torch.arange(16, dtype=torch.float16).reshape(4, 4)
+    first_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": first_hidden},
+        FakePPGroup(use_all_gather=True),
+        all_gather_group,
+        None,
+        config,
+        first_plan,
+    )
+    assert first_packet is not None
+    pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        first_packet,
+        all_gather_group,
+        first_plan,
+    )
+
+    second_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("second", [10, 11, 12, 13]),
+        all_gather_group,
+    )
+    first_req_uid = first_plan.token_segments[0, 3].item()
+    assert second_plan.match_spans.tolist() == [
+        [1, 1, first_req_uid, 1, 0, 0]
+    ]
+
+    second_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": first_hidden + 0.25},
+        FakePPGroup(use_all_gather=True),
+        all_gather_group,
+        None,
+        config,
+        second_plan,
+    )
+    assert second_packet is not None
+    delta_spans_key = pp_refcache._DELTA_MATCH_SPANS_KEY  # type: ignore[attr-defined]
+    assert second_packet[delta_spans_key].tolist() == [
+        [1, 1, first_req_uid, 1, 0, 0]
+    ]
+
+
+def test_pp_refcache_all_gather_mid_row_slice_skips_refcache_commit() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=2,
+    )
+    all_gather_group = FakeAllGatherGroup()
+
+    first_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("first", [10, 11, 12]),
+        all_gather_group,
+    )
+    first_hidden = torch.arange(12, dtype=torch.float16).reshape(3, 4)
+    first_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": first_hidden},
+        FakePPGroup(use_all_gather=True),
+        all_gather_group,
+        None,
+        config,
+        first_plan,
+    )
+    assert first_packet is not None
+
+    second_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("second", [10, 11, 12]),
+        all_gather_group,
+    )
+    assert second_plan.match_spans.numel() == 0
+
+
+def test_pp_refcache_min_match_rate_disables_delta() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+        min_match_rate=1.0,
+        max_packet_ratio=10.0,
+    )
+    first_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("first", [10, 11, 12, 13]),
+        None,
+    )
+    first_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.arange(16, dtype=torch.float16).reshape(4, 4)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        first_plan,
+    )
+    assert first_packet is not None
+    pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        first_packet,
+        None,
+        first_plan,
+    )
+
+    second_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("second", [10, 11, 12, 13]),
+        None,
+    )
+    assert second_plan.match_spans.numel() > 0
+    second_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.arange(16, dtype=torch.float16).reshape(4, 4)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        second_plan,
+    )
+    assert second_packet is not None
+    delta_spans_key = pp_refcache._DELTA_MATCH_SPANS_KEY  # type: ignore[attr-defined]
+    assert second_packet[delta_spans_key].numel() == 0
+
+
+def test_pp_refcache_packet_ratio_falls_back_to_raw_pp_path() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+        max_packet_ratio=0.1,
+    )
+    packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.ones((2, 4), dtype=torch.float16)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+    )
+    assert packet is None
+
+
+def test_pp_refcache_min_hidden_bytes_uses_total_mixed_batch_bytes() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=47,
+        int8_group_size=4,
+    )
+    packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.ones((6, 4), dtype=torch.float16)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        pp_refcache.build_phase1_plan(FakeSchedulerOutput(), None),
+    )
+    assert packet is not None
+
+
+def test_pp_refcache_receiver_missing_ref_fails_closed() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+        max_packet_ratio=10.0,
+    )
+    first_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("first", [10, 11, 12, 13]),
+        None,
+    )
+    first_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.arange(16, dtype=torch.float16).reshape(4, 4)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        first_plan,
+    )
+    assert first_packet is not None
+    # Do not decode first_packet, so the receiver cache intentionally misses.
+    second_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("second", [10, 11, 12, 13]),
+        None,
+    )
+    second_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.arange(16, dtype=torch.float16).reshape(4, 4)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        second_plan,
+    )
+    assert second_packet is not None
+    with pytest.raises(RuntimeError, match="missing a referenced activation"):
+        pp_refcache._decode_packet(  # type: ignore[attr-defined]
+            second_packet,
+            None,
+            second_plan,
+        )
+
+
+def test_pp_refcache_triton_kernel_entry_falls_back_on_cpu() -> None:
+    hidden_states = torch.ones((2, 4), dtype=torch.float16)
+    positions = torch.tensor([1], dtype=torch.int64)
+    refs = torch.ones((1, 4), dtype=torch.float16)
+
+    assert triton_encode_int8_with_refs(hidden_states, positions, refs, 4) is None
 
 
 def test_pp_refcache_encode_decode_int8_packet() -> None:
