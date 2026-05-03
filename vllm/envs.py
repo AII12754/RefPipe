@@ -48,6 +48,10 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_DISABLE_RESIDUAL_CONSOLIDATION: bool = False
+    VLLM_PP_REFCACHE_ENABLE: bool = False
+    VLLM_PP_REFCACHE_CODEC: Literal["int8"] = "int8"
+    VLLM_PP_REFCACHE_MIN_HIDDEN_BYTES: int = 1 << 20
+    VLLM_PP_REFCACHE_INT8_GROUP_SIZE: int = 128
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -733,6 +737,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "1" to restore the previous behavior of transmitting residual.
     "VLLM_PP_DISABLE_RESIDUAL_CONSOLIDATION": lambda: bool(
         int(os.getenv("VLLM_PP_DISABLE_RESIDUAL_CONSOLIDATION", "0"))
+    ),
+    # Enable experimental PP RefCache compressed activation transport.
+    "VLLM_PP_REFCACHE_ENABLE": lambda: bool(
+        int(os.getenv("VLLM_PP_REFCACHE_ENABLE", "0"))
+    ),
+    # Milestone 1 supports raw INT8 transport only. Later milestones add
+    # reference-delta codecs behind the same packet protocol.
+    "VLLM_PP_REFCACHE_CODEC": env_with_choices(
+        "VLLM_PP_REFCACHE_CODEC",
+        "int8",
+        ["int8"],
+        case_sensitive=False,
+    ),
+    "VLLM_PP_REFCACHE_MIN_HIDDEN_BYTES": lambda: int(
+        os.getenv("VLLM_PP_REFCACHE_MIN_HIDDEN_BYTES", str(1 << 20))
+    ),
+    "VLLM_PP_REFCACHE_INT8_GROUP_SIZE": lambda: int(
+        os.getenv("VLLM_PP_REFCACHE_INT8_GROUP_SIZE", "128")
     ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
