@@ -275,6 +275,7 @@ def test_pp_refcache_all_gather_mid_row_slice_skips_refcache_commit() -> None:
         codec="int8",
         min_hidden_bytes=0,
         int8_group_size=2,
+        max_packet_ratio=10.0,
     )
     all_gather_group = FakeAllGatherGroup()
 
