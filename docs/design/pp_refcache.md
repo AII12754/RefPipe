@@ -332,10 +332,15 @@ VLLM_PP_REFCACHE_INT8_GROUP_SIZE=128
 
 ### Milestone 2: Phase 1 Match Plan
 
-- Build request token segments from `InputBatch` and request state.
+- Build request token segments from scheduler output and request state.
 - Add pre-forward Phase 1 send and receive for PP boundaries.
-- Implement span-encoded match plans.
-- Add receiver reference availability validation.
+- Implement span-encoded Phase 1 packet fields:
+  `token_segments`, `match_spans`, and `self_ref_spans`.
+- In the first implementation, emit prefill-only token segments and keep
+  `match_spans` / `self_ref_spans` empty. Actual matching, reference
+  availability checks, and prefetch are Milestone 3 work.
+- Carry a deterministic `plan_id` in Phase 2 compressed packets and validate it
+  on receive.
 - Keep Phase 2 raw quantized transport until Phase 1 correctness is validated.
 
 ### Milestone 3: RefCache Delta Codec

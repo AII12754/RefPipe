@@ -37,8 +37,11 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.distributed.pp_refcache import (
+    build_phase1_plan,
     irecv_pp_refcache_tensor_dict,
     isend_pp_refcache_tensor_dict,
+    recv_pp_refcache_phase1_plan,
+    send_pp_refcache_phase1_plan,
 )
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
@@ -819,13 +822,27 @@ class Worker(WorkerBase):
                 )
             }
 
+        pp_refcache_phase1_plan = None
+        if (
+            envs.VLLM_PP_REFCACHE_ENABLE
+            and forward_pass
+            and not get_pp_group().is_last_rank
+        ):
+            pp_refcache_phase1_plan = build_phase1_plan(
+                scheduler_output,
+                get_tp_group(),
+            )
+            send_pp_refcache_phase1_plan(get_pp_group(), pp_refcache_phase1_plan)
+
         if forward_pass and not get_pp_group().is_first_rank:
             if envs.VLLM_PP_REFCACHE_ENABLE:
+                recv_phase1_plan = recv_pp_refcache_phase1_plan(get_pp_group())
                 tensor_dict, comm_handles, comm_postprocess = (
                     irecv_pp_refcache_tensor_dict(
                         get_pp_group(),
                         all_gather_group=get_tp_group(),
                         all_gather_tensors=all_gather_tensors,
+                        expected_phase1_plan=recv_phase1_plan,
                     )
                 )
             else:
@@ -871,6 +888,7 @@ class Worker(WorkerBase):
                 output.tensors,
                 all_gather_group=get_tp_group(),
                 all_gather_tensors=all_gather_tensors,
+                phase1_plan=pp_refcache_phase1_plan,
             )
         else:
             self._pp_send_work = get_pp_group().isend_tensor_dict(

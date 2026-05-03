@@ -1,9 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.distributed import pp_refcache
+
+
+class FakeNewReq:
+    def __init__(
+        self,
+        req_id: str,
+        prompt_token_ids: list[int],
+        num_computed_tokens: int,
+    ) -> None:
+        self.req_id = req_id
+        self.prompt_token_ids = prompt_token_ids
+        self.num_computed_tokens = num_computed_tokens
+
+
+class FakeCachedReqs:
+    req_ids = ["decode", "prefill"]
+    num_computed_tokens = [10, 4]
+
+    def is_context_phase(self, req_id: str) -> bool:
+        return req_id == "prefill"
+
+
+class FakeSchedulerOutput:
+    scheduled_new_reqs = [
+        FakeNewReq("new", [1, 2, 3, 4, 5], 1),
+    ]
+    scheduled_cached_reqs = FakeCachedReqs()
+    num_scheduled_tokens = {
+        "decode": 1,
+        "new": 3,
+        "prefill": 2,
+    }
+    total_num_scheduled_tokens = 6
 
 
 class FakePPGroup:
@@ -21,6 +55,85 @@ class FakeAllGatherGroup:
     def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
         assert dim == 0
         return torch.cat([tensor, tensor], dim=dim)
+
+
+def test_pp_refcache_phase1_plan_segments_prefill_only() -> None:
+    plan = pp_refcache.build_phase1_plan(FakeSchedulerOutput(), None)
+
+    assert plan.num_global_tokens == 6
+    assert plan.tp_rank == 0
+    assert plan.tp_size == 1
+    assert plan.match_spans.shape == (0, 6)
+    assert plan.self_ref_spans.shape == (0, 4)
+    assert plan.token_segments.shape == (2, 5)
+    # Batch order follows GPUModelRunner.prepare_inputs: decode first, then
+    # smaller prefills before larger prefills.
+    assert plan.token_segments[:, :3].tolist() == [
+        [1, 2, 4],
+        [3, 3, 1],
+    ]
+
+
+def test_pp_refcache_phase2_packet_carries_phase1_plan_id() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+    )
+    plan = pp_refcache.build_phase1_plan(FakeSchedulerOutput(), None)
+    hidden_states = torch.ones((2, 4), dtype=torch.float16)
+    packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": hidden_states},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        plan,
+    )
+
+    assert packet is not None
+    decoded = pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        packet,
+        None,
+        plan,
+    )
+    assert decoded["hidden_states"].shape == hidden_states.shape
+
+
+def test_pp_refcache_phase2_rejects_mismatched_phase1_plan() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+    )
+    plan = pp_refcache.build_phase1_plan(FakeSchedulerOutput(), None)
+    wrong_plan = pp_refcache.PPRefCachePhase1Plan(
+        plan_id=plan.plan_id + 1,
+        num_global_tokens=plan.num_global_tokens,
+        tp_rank=plan.tp_rank,
+        tp_size=plan.tp_size,
+        token_segments=plan.token_segments,
+        match_spans=plan.match_spans,
+        self_ref_spans=plan.self_ref_spans,
+    )
+    packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": torch.ones((2, 4), dtype=torch.float16)},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        plan,
+    )
+
+    assert packet is not None
+    with pytest.raises(ValueError, match="Phase 2 packet does not match"):
+        pp_refcache._decode_packet(  # type: ignore[attr-defined]
+            packet,
+            None,
+            wrong_plan,
+        )
 
 
 def test_pp_refcache_encode_decode_int8_packet() -> None:
