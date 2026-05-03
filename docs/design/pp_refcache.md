@@ -350,8 +350,16 @@ VLLM_PP_REFCACHE_INT8_GROUP_SIZE=128
 - Encode matched regions as `ref + quant(delta)`.
 - Encode unmatched regions as quantized raw hidden.
 - Commit reconstructed hidden on both sender and receiver.
-- Add cache capacity and deterministic eviction.
-- Add numerical error checks and raw fp16 fallback regions.
+- Add deterministic cache capacity eviction.
+- First implementation scope:
+  - delta matching is enabled only when the PP payload remains a local
+    `[tokens, hidden]` tensor;
+  - TP all-gather slice packets stay on raw INT8 transport and skip cache
+    commit until Milestone 4 adds shard-aware keys;
+  - decode/mixed-batch non-prefill tokens remain raw INT8 and are not committed
+    to RefCache state.
+- Raw fp16 fallback regions and fused numerical-error guards remain future
+  codec hardening work.
 
 ### Milestone 4: TP and Sequence Parallel Coverage
 

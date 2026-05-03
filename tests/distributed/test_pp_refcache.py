@@ -7,6 +7,11 @@ import torch
 from vllm.distributed import pp_refcache
 
 
+@pytest.fixture(autouse=True)
+def clear_pp_refcache_state() -> None:
+    pp_refcache.clear_pp_refcache_state()
+
+
 class FakeNewReq:
     def __init__(
         self,
@@ -16,11 +21,14 @@ class FakeNewReq:
     ) -> None:
         self.req_id = req_id
         self.prompt_token_ids = prompt_token_ids
+        self.prefill_token_ids = prompt_token_ids
         self.num_computed_tokens = num_computed_tokens
 
 
 class FakeCachedReqs:
     req_ids = ["decode", "prefill"]
+    new_token_ids = [[], [20, 21]]
+    all_token_ids = {"prefill": [16, 17, 18, 19, 20, 21]}
     num_computed_tokens = [10, 4]
 
     def is_context_phase(self, req_id: str) -> bool:
@@ -38,6 +46,15 @@ class FakeSchedulerOutput:
         "prefill": 2,
     }
     total_num_scheduled_tokens = 6
+
+
+class SinglePrefillSchedulerOutput:
+    scheduled_cached_reqs = FakeCachedReqs()
+    total_num_scheduled_tokens = 4
+
+    def __init__(self, req_id: str, token_ids: list[int]) -> None:
+        self.scheduled_new_reqs = [FakeNewReq(req_id, token_ids, 0)]
+        self.num_scheduled_tokens = {req_id: len(token_ids)}
 
 
 class FakePPGroup:
@@ -134,6 +151,66 @@ def test_pp_refcache_phase2_rejects_mismatched_phase1_plan() -> None:
             None,
             wrong_plan,
         )
+
+
+def test_pp_refcache_delta_roundtrip_uses_committed_refs() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+    )
+
+    first_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("first", [10, 11, 12, 13]),
+        None,
+    )
+    first_hidden = torch.arange(16, dtype=torch.float16).reshape(4, 4)
+    first_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": first_hidden},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        first_plan,
+    )
+    assert first_packet is not None
+    first_decoded = pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        first_packet,
+        None,
+        first_plan,
+    )
+
+    second_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("second", [10, 11, 12, 13]),
+        None,
+    )
+    first_req_uid = first_plan.token_segments[0, 3].item()
+    assert second_plan.match_spans.tolist() == [
+        [1, 3, first_req_uid, 1, 0, 0]
+    ]
+    second_hidden = first_decoded["hidden_states"] + torch.full(
+        (4, 4),
+        0.25,
+        dtype=torch.float16,
+    )
+    second_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": second_hidden},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        second_plan,
+    )
+
+    assert second_packet is not None
+    second_decoded = pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        second_packet,
+        None,
+        second_plan,
+    )
+    assert second_decoded["hidden_states"].shape == second_hidden.shape
+    assert torch.allclose(second_decoded["hidden_states"], second_hidden, atol=0.05)
 
 
 def test_pp_refcache_encode_decode_int8_packet() -> None:
