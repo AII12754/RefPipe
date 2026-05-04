@@ -747,8 +747,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_REFCACHE_ENABLE": lambda: bool(
         int(os.getenv("VLLM_PP_REFCACHE_ENABLE", "0"))
     ),
-    # Milestone 1 supports raw INT8 transport only. Later milestones add
-    # reference-delta codecs behind the same packet protocol.
+    # Current prototype supports INT8 raw transport and INT8 reference-delta
+    # transport behind the same packet protocol.
     "VLLM_PP_REFCACHE_CODEC": env_with_choices(
         "VLLM_PP_REFCACHE_CODEC",
         "int8",

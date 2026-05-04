@@ -787,8 +787,9 @@ def build_phase1_plan(
 ) -> PPRefCachePhase1Plan:
     """Build the sender-selected Phase 1 plan for the current PP batch.
 
-    Milestone 2 only emits prefill token segments. Match spans and self-ref
-    spans stay empty until the RefCache matcher lands in Milestone 3.
+    The current implementation emits prefill-only token segments and sender-
+    selected match spans. Decode rows are excluded from RefCache matching and
+    cache commit.
     """
     _flush_pending_commits(_PENDING_SEND_COMMITS, "send_commit_flush")
     profile_start = time.perf_counter()

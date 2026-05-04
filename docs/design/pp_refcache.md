@@ -12,6 +12,34 @@ current token context matches a cached context.
 This is a lossy, experimental transport optimization. It must be disabled by
 default and guarded by runtime fallbacks.
 
+## Current Status
+
+The current branch implements the first end-to-end V1 prototype with the
+following scope:
+
+- Phase 1 and Phase 2 are both wired into the PP path.
+- `hidden_states` is the only compressed tensor. `residual` is not sent
+  separately and is not part of RefCache state.
+- RefCache matching is prefill-only. Decode rows may still use INT8 transport
+  when the batch-level gate enables compression, but they do not participate in
+  matching or cache commit.
+- The only supported codec is groupwise INT8.
+- Long-lived RefCache state stays on CPU. GPU memory is used only for a bounded
+  staging buffer that prefetches matched reference activations for the current
+  batch.
+- TP all-gather packets are supported in the current vLLM flattened-slice form.
+  RefCache delta is enabled when the local PP slice aligns to whole token rows;
+  otherwise the packet falls back to raw INT8 and skips cache commit.
+- Sender and receiver both commit reconstructed hidden states, not original
+  hidden states.
+- Cache commit is asynchronous and flushed before later matching or reference
+  prefetch so correctness remains fail-closed.
+
+This means the document below describes both the stable design constraints and
+the current prototype behavior. Where the original milestone plan and the
+current implementation differ, the implementation should be treated as the
+source of truth for this branch.
+
 ## Current PP Transfer Path
 
 Today, a PP boundary has one logical intermediate tensor transfer:
@@ -309,17 +337,54 @@ The feature should be guarded by an explicit configuration flag or environment
 variable and should fall back to the current PP transfer path whenever an
 unsupported model path or batch shape is detected.
 
+## Implementation Status
+
+### Completed in the Current Prototype
+
+- Disabled-by-default feature flag and runtime fallback path.
+- Tensorized Phase 1 packet with deterministic `plan_id`.
+- Batch-level gating by total hidden bytes.
+- Prefill token segment extraction from scheduler output.
+- Sender-side bigram maximal-forward matching for prefill regions.
+- Raw INT8 transport for unmatched rows.
+- INT8 delta transport for matched prefill rows.
+- Boundary-local CPU RefCache on sender and receiver.
+- Deterministic fail-closed decode if a requested receiver reference is missing.
+- Packet ratio gate and minimum matched-rate gate.
+- Triton encode/decode kernels for matched INT8 delta packets.
+- CPU-to-GPU reference prefetch staging with a bounded GPU buffer.
+- TP all-gather support for whole-token-row slices.
+- Unit tests for Phase 1/Phase 2 protocol, fallback behavior, TP row-slice
+  behavior, CUDA kernel round-trip, and receiver miss failure.
+- Benchmark harness for PP RefCache end-to-end timing.
+
+### Remaining Work
+
+- Broader TP coverage beyond the current whole-token-row all-gather case.
+- Mixed-batch validation under more realistic scheduler patterns.
+- Longer-running cache-lifetime validation, especially eviction behavior under
+  sustained multi-request load.
+- Cross-node benchmarking. Same-node benchmarks are useful for overhead
+  measurement but do not capture the bandwidth savings that motivate the
+  feature.
+- Quality evaluation and acceptance thresholds for lossy INT8 transport.
+- Possible future codecs such as FP8 raw transport or INT4 delta transport.
+
 ## Development Plan
 
 ### Milestone 1: Baseline Transport Packet
 
-- Add a disabled-by-default PP RefCache feature flag.
-- Implement packet metadata structures with tensorized headers.
-- Implement batch-level gating by total hidden bytes.
-- Implement raw FP8 or INT8 transport for `hidden_states` without RefCache.
-- Support PP size greater than one and TP local shard send.
-- Fall back to existing PP transfer for unsupported tensors.
-- Add unit tests for packet encode/decode shape and fallback behavior.
+- Status: complete in the current branch.
+- Delivered:
+  - disabled-by-default PP RefCache feature flag;
+  - tensorized packet metadata and fallback path;
+  - batch-level gating by total hidden bytes;
+  - raw INT8 transport for `hidden_states`;
+  - PP size greater than one and current TP local-slice send behavior;
+  - unit tests for packet encode/decode shape and fallback behavior.
+- Notes:
+  - the branch does not implement FP8 transport;
+  - `hidden_states` remains the only compressed tensor.
 
 Initial implementation flags:
 
@@ -335,70 +400,60 @@ VLLM_PP_REFCACHE_MAX_PACKET_RATIO=1.0
 
 ### Milestone 2: Phase 1 Match Plan
 
-- Build request token segments from scheduler output and request state.
-- Add pre-forward Phase 1 send and receive for PP boundaries.
-- Implement span-encoded Phase 1 packet fields:
-  `token_segments`, `match_spans`, and `self_ref_spans`.
-- In the first implementation, emit prefill-only token segments and keep
-  `match_spans` / `self_ref_spans` empty. Actual matching, reference
-  availability checks, and prefetch are Milestone 3 work.
-- Carry a deterministic `plan_id` in Phase 2 compressed packets and validate it
-  on receive.
-- Keep Phase 2 raw quantized transport until Phase 1 correctness is validated.
+- Status: complete, but the implementation went past the original milestone
+  boundary.
+- Delivered:
+  - request token segments built from scheduler output and request state;
+  - pre-forward Phase 1 send and receive for PP boundaries;
+  - span-encoded `token_segments`, `match_spans`, and `self_ref_spans` fields;
+  - deterministic `plan_id` carried in Phase 2 packets and validated on
+    receive.
+- Notes:
+  - unlike the original plan, `match_spans` is not left empty in this branch;
+    sender-side matching is already active.
 
 ### Milestone 3: RefCache Delta Codec
 
-- Implement boundary-local activation tables and reference stores.
-- Add bigram maximal-forward matching for prefill regions.
-- Encode matched regions as `ref + quant(delta)`.
-- Encode unmatched regions as quantized raw hidden.
-- Commit reconstructed hidden on both sender and receiver.
-- Add deterministic cache capacity eviction.
-- Fail closed if the receiver is asked to decode a delta whose reference is
-  missing.
-- Gate delta use by minimum matched-token rate.
-- Fall back to the original PP path if the estimated compressed packet ratio
-  exceeds `VLLM_PP_REFCACHE_MAX_PACKET_RATIO`.
-- First implementation scope:
-  - delta matching is enabled only when the PP payload remains a local
-    `[tokens, hidden]` tensor. Milestone 4 extends this to TP all-gather
-    slices that align with full token rows;
-  - decode/mixed-batch non-prefill tokens remain raw INT8 and are not committed
-    to RefCache state.
-- Raw fp16 fallback regions and fused numerical-error guards remain future
-  codec hardening work.
+- Status: substantially complete for the current prototype scope.
+- Delivered:
+  - boundary-local activation tables and reference stores;
+  - bigram maximal-forward matching for prefill regions;
+  - matched `ref + quant(delta)` transport and unmatched raw INT8 transport;
+  - reconstructed hidden commit on both sender and receiver;
+  - deterministic cache capacity eviction;
+  - fail-closed decode on receiver miss;
+  - minimum matched-rate and packet-ratio gates.
+- Notes:
+  - cache state is CPU-resident;
+  - current Triton kernels cover the matched INT8 path;
+  - raw fp16 fallback regions and stronger numerical guardrails remain future
+    codec-hardening work.
 
 ### Milestone 4: TP and Sequence Parallel Coverage
 
-- Implement replicated-hidden local slice compression.
-- Decode local slices before TP all-gather.
-- Add sequence-parallel token-shard packet metadata.
-- First implementation scope:
-  - when vLLM's PP all-gather optimization slices the flattened hidden tensor
-    on token-row boundaries, each TP rank clips the Phase 1 plan to its local
-    token rows and applies RefCache delta locally before/after PP transfer;
-  - when a flat slice cuts through a token row, the packet remains raw INT8 and
-    skips RefCache commit;
-  - token-row local packets commit shard-local hidden vectors under the same
-    request/token keys in each TP rank process, so sender/receiver state stays
-    aligned without changing the existing flat slice communication contract.
-- Add tests for TP sizes greater than one.
-- Add tests for mixed prefill/decode batches.
+- Status: partially complete.
+- Delivered:
+  - local-slice compression for the current all-gather PP path when the flat
+    slice aligns to whole token rows;
+  - decode of local slices before TP all-gather;
+  - raw INT8 fallback when a flat slice cuts through a token row.
+- Remaining:
+  - broader TP coverage and explicit sequence-parallel metadata contracts;
+  - larger TP test matrix and more mixed prefill/decode scheduler coverage.
 
 ### Milestone 5: Fused Kernels and Tuning
 
-- Add fused subtract-reference-and-quantize kernel. The Python implementation
-  already isolates this behind the encode path that computes
-  `hidden - ref -> q_payload, scales, reconstructed`.
-- Add fused dequantize-and-add-reference kernel. The Python implementation
-  already isolates this behind the decode path that computes
-  `q_payload, scales, ref -> reconstructed`.
-- First Triton implementation lives in
-  `vllm/distributed/pp_refcache_kernels.py` and is used for CUDA 2D
-  `[tokens, hidden]` tensors with matched reference rows.
-- Tune thresholds for hidden bytes, match rate, and estimated packet ratio.
-- Benchmark against raw PP transfer on prefill-heavy workloads.
-- Add quality regression tests for selected models and prompts.
+- Status: partially complete.
+- Delivered:
+  - first Triton encode/decode kernels in
+    `vllm/distributed/pp_refcache_kernels.py`;
+  - threshold tuning to the extent needed to keep current-node overhead within
+    a reasonable range;
+  - same-node benchmark coverage for short and long prefill workloads.
+- Remaining:
+  - more aggressive kernel tuning;
+  - cross-node benchmark validation;
+  - quality regression tests and explicit accuracy criteria.
 
 ## Open Questions
 
