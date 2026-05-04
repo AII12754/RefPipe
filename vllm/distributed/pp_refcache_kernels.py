@@ -75,6 +75,27 @@ def _pp_refcache_decode_int8_kernel(
     tl.store(out_ptr + row * n_cols + cols, hidden, mask=mask)
 
 
+@triton.jit
+def _pp_refcache_decode_raw_int8_kernel(
+    q_ptr,
+    scales_ptr,
+    out_ptr,
+    n_cols: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    cols = group * group_size + offsets
+    mask = offsets < group_size
+
+    q = tl.load(q_ptr + row * n_cols + cols, mask=mask).to(tl.float32)
+    scale = tl.load(scales_ptr + row * (n_cols // group_size) + group).to(tl.float32)
+    hidden = q * scale
+    tl.store(out_ptr + row * n_cols + cols, hidden, mask=mask)
+
+
 def _can_use_triton_refcache(
     tensor: torch.Tensor,
     positions: torch.Tensor,
@@ -147,6 +168,38 @@ def triton_encode_int8_with_refs(
         BLOCK=triton.next_power_of_2(group_size),
     )
     return q_payload, scales, reconstructed
+
+
+def triton_decode_int8(
+    q_payload: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if not (
+        HAS_TRITON
+        and q_payload.is_cuda
+        and scales.is_cuda
+        and q_payload.ndim == 2
+        and q_payload.is_contiguous()
+        and scales.is_contiguous()
+        and group_size > 0
+        and q_payload.shape[1] % group_size == 0
+    ):
+        return None
+
+    n_rows, n_cols = q_payload.shape
+    hidden_states = torch.empty((n_rows, n_cols), dtype=dtype, device=q_payload.device)
+    grid = (n_rows, n_cols // group_size)
+    _pp_refcache_decode_raw_int8_kernel[grid](
+        q_payload,
+        scales,
+        hidden_states,
+        n_cols,
+        group_size,
+        BLOCK=triton.next_power_of_2(group_size),
+    )
+    return hidden_states
 
 
 def triton_decode_int8_with_refs(

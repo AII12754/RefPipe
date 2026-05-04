@@ -5,7 +5,10 @@ import pytest
 import torch
 
 from vllm.distributed import pp_refcache
-from vllm.distributed.pp_refcache_kernels import triton_encode_int8_with_refs
+from vllm.distributed.pp_refcache_kernels import (
+    triton_decode_int8_with_refs,
+    triton_encode_int8_with_refs,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -189,7 +192,7 @@ def test_pp_refcache_delta_roundtrip_uses_committed_refs() -> None:
     )
     first_req_uid = first_plan.token_segments[0, 3].item()
     assert second_plan.match_spans.tolist() == [
-        [1, 3, first_req_uid, 1, 0, 0]
+        [1, 3, first_req_uid, 1, 0, 1]
     ]
     second_hidden = first_decoded["hidden_states"] + torch.full(
         (4, 4),
@@ -251,7 +254,7 @@ def test_pp_refcache_all_gather_token_row_slice_uses_local_refs() -> None:
     )
     first_req_uid = first_plan.token_segments[0, 3].item()
     assert second_plan.match_spans.tolist() == [
-        [1, 1, first_req_uid, 1, 0, 0]
+        [1, 1, first_req_uid, 1, 0, 1]
     ]
 
     second_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
@@ -265,7 +268,7 @@ def test_pp_refcache_all_gather_token_row_slice_uses_local_refs() -> None:
     assert second_packet is not None
     delta_spans_key = pp_refcache._DELTA_MATCH_SPANS_KEY  # type: ignore[attr-defined]
     assert second_packet[delta_spans_key].tolist() == [
-        [1, 1, first_req_uid, 1, 0, 0]
+        [1, 1, first_req_uid, 1, 0, 1]
     ]
 
 
@@ -299,6 +302,19 @@ def test_pp_refcache_all_gather_mid_row_slice_skips_refcache_commit() -> None:
         all_gather_group,
     )
     assert second_plan.match_spans.numel() == 0
+
+
+def test_pp_refcache_packet_tensors_skip_transport_all_gather() -> None:
+    overrides = pp_refcache._packet_all_gather_overrides(  # type: ignore[attr-defined]
+        {"residual": True}
+    )
+
+    assert overrides["residual"]
+    assert not overrides[pp_refcache._Q_PAYLOAD_KEY]  # type: ignore[attr-defined]
+    assert not overrides[pp_refcache._SCALES_KEY]  # type: ignore[attr-defined]
+    assert not overrides[  # type: ignore[attr-defined]
+        pp_refcache._DELTA_MATCH_SPANS_KEY  # type: ignore[attr-defined]
+    ]
 
 
 def test_pp_refcache_min_match_rate_disables_delta() -> None:
@@ -432,6 +448,90 @@ def test_pp_refcache_triton_kernel_entry_falls_back_on_cpu() -> None:
     refs = torch.ones((1, 4), dtype=torch.float16)
 
     assert triton_encode_int8_with_refs(hidden_states, positions, refs, 4) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pp_refcache_triton_kernel_roundtrip_cuda() -> None:
+    hidden_states = torch.arange(32, device="cuda", dtype=torch.float16).reshape(4, 8)
+    positions = torch.tensor([1, 3], device="cuda", dtype=torch.int64)
+    refs = torch.stack(
+        [hidden_states[1] - 0.25, hidden_states[3] + 0.5],
+    ).contiguous()
+
+    encoded = triton_encode_int8_with_refs(hidden_states, positions, refs, 4)
+    assert encoded is not None
+    q_payload, scales, reconstructed = encoded
+    decoded = triton_decode_int8_with_refs(
+        q_payload,
+        scales,
+        positions,
+        refs,
+        4,
+        torch.float16,
+    )
+
+    assert decoded is not None
+    torch.cuda.synchronize()
+    assert q_payload.dtype == torch.int8
+    assert scales.dtype == torch.float32
+    assert torch.allclose(reconstructed, hidden_states, atol=0.1)
+    assert torch.allclose(decoded, hidden_states, atol=0.1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pp_refcache_protocol_uses_triton_kernel_cuda() -> None:
+    config = pp_refcache.PPRefCacheConfig(
+        enabled=True,
+        codec="int8",
+        min_hidden_bytes=0,
+        int8_group_size=4,
+        max_packet_ratio=10.0,
+    )
+
+    first_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("first", [10, 11, 12, 13]),
+        None,
+    )
+    first_hidden = torch.arange(32, device="cuda", dtype=torch.float16).reshape(4, 8)
+    first_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": first_hidden},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        first_plan,
+    )
+    assert first_packet is not None
+    first_decoded = pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        first_packet,
+        None,
+        first_plan,
+    )
+
+    second_plan = pp_refcache.build_phase1_plan(
+        SinglePrefillSchedulerOutput("second", [10, 11, 12, 13]),
+        None,
+    )
+    second_hidden = first_decoded["hidden_states"] + 0.25
+    second_packet = pp_refcache._encode_packet(  # type: ignore[attr-defined]
+        {"hidden_states": second_hidden},
+        FakePPGroup(),
+        None,
+        None,
+        config,
+        second_plan,
+    )
+
+    assert second_packet is not None
+    stats_key = pp_refcache._PACKET_STATS_KEY  # type: ignore[attr-defined]
+    assert second_packet[stats_key]["encode_path"] == "triton"
+    second_decoded = pp_refcache._decode_packet(  # type: ignore[attr-defined]
+        second_packet,
+        None,
+        second_plan,
+    )
+    torch.cuda.synchronize()
+    assert torch.allclose(second_decoded["hidden_states"], second_hidden, atol=0.05)
 
 
 def test_pp_refcache_encode_decode_int8_packet() -> None:

@@ -53,8 +53,10 @@ if TYPE_CHECKING:
     VLLM_PP_REFCACHE_MIN_HIDDEN_BYTES: int = 1 << 20
     VLLM_PP_REFCACHE_INT8_GROUP_SIZE: int = 128
     VLLM_PP_REFCACHE_MAX_TOKENS: int = 100000
+    VLLM_PP_REFCACHE_PREFETCH_MAX_BYTES: int = 1 << 30
     VLLM_PP_REFCACHE_MIN_MATCH_RATE: float = 0.0
     VLLM_PP_REFCACHE_MAX_PACKET_RATIO: float = 1.0
+    VLLM_PP_REFCACHE_PROFILE: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -762,11 +764,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_REFCACHE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_PP_REFCACHE_MAX_TOKENS", "100000")
     ),
+    "VLLM_PP_REFCACHE_PREFETCH_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_PP_REFCACHE_PREFETCH_MAX_BYTES", str(1 << 30))
+    ),
     "VLLM_PP_REFCACHE_MIN_MATCH_RATE": lambda: float(
         os.getenv("VLLM_PP_REFCACHE_MIN_MATCH_RATE", "0.0")
     ),
     "VLLM_PP_REFCACHE_MAX_PACKET_RATIO": lambda: float(
         os.getenv("VLLM_PP_REFCACHE_MAX_PACKET_RATIO", "1.0")
+    ),
+    "VLLM_PP_REFCACHE_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_PP_REFCACHE_PROFILE", "0"))
     ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB

@@ -38,8 +38,11 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.distributed.pp_refcache import (
     build_phase1_plan,
+    configure_pp_refcache_prefetch,
     irecv_pp_refcache_tensor_dict,
     isend_pp_refcache_tensor_dict,
+    prefetch_pp_refcache_recv_refs,
+    prefetch_pp_refcache_send_refs,
     recv_pp_refcache_phase1_plan,
     send_pp_refcache_phase1_plan,
 )
@@ -161,6 +164,13 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        if envs.VLLM_PP_REFCACHE_ENABLE:
+            max_refcache_activation_bytes = (
+                self.scheduler_config.max_num_batched_tokens
+                * self.model_config.get_hidden_size()
+                * self.model_config.dtype.itemsize
+            )
+            configure_pp_refcache_prefetch(max_refcache_activation_bytes)
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -833,10 +843,20 @@ class Worker(WorkerBase):
                 get_tp_group(),
             )
             send_pp_refcache_phase1_plan(get_pp_group(), pp_refcache_phase1_plan)
+            prefetch_pp_refcache_send_refs(
+                pp_refcache_phase1_plan,
+                torch.device("cuda", torch.cuda.current_device()),
+                self.model_config.dtype,
+            )
 
         if forward_pass and not get_pp_group().is_first_rank:
             if envs.VLLM_PP_REFCACHE_ENABLE:
                 recv_phase1_plan = recv_pp_refcache_phase1_plan(get_pp_group())
+                prefetch_pp_refcache_recv_refs(
+                    recv_phase1_plan,
+                    torch.device("cuda", torch.cuda.current_device()),
+                    self.model_config.dtype,
+                )
                 tensor_dict, comm_handles, comm_postprocess = (
                     irecv_pp_refcache_tensor_dict(
                         get_pp_group(),
